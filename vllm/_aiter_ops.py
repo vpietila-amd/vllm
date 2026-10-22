@@ -1170,6 +1170,28 @@ def _rocm_aiter_rmsnorm_fused_dynamic_quant_fake(
     return out, y_scale
 
 
+def _flydsl_fused_qr_comm(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    gemma_norm: bool = False,
+) -> Any:
+    """The TP QuickReduce communicator when AITER's FlyDSL INT4 schedules can
+    fuse this all-reduce + RMSNorm, else None.
+
+    They take the payloads in their mesh/ring windows; the smaller ones are
+    left to the AITER custom all-reduce.
+    """
+    from vllm.distributed import get_tp_group
+
+    qr_comm = getattr(get_tp_group().device_communicator, "qr_comm", None)
+    if qr_comm is None or not getattr(qr_comm, "uses_flydsl", False):
+        return None
+    if not qr_comm.should_fused_allreduce_rmsnorm(input_, residual, weight, gemma_norm):
+        return None
+    return qr_comm
+
+
 def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     input_: torch.Tensor,
     residual: torch.Tensor,
@@ -1179,6 +1201,9 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
+    fly_qr_comm = _flydsl_fused_qr_comm(input_, residual, weight, gemma_norm)
+    if fly_qr_comm is not None:
+        return fly_qr_comm.fused_allreduce_rmsnorm(input_, residual, weight, epsilon)
     ca = aiter_ar.aiter_ca
     use_1stage = aiter_ar.use_1stage_fused_ar_rms(input_)
 
@@ -1195,6 +1220,8 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
             not gemma_norm
             and qr_comm is not None
             and not getattr(qr_comm, "disabled", True)
+            # The FlyDSL schedules hold no HIP QuickReduce communicator.
+            and not getattr(qr_comm, "uses_flydsl", False)
             and hasattr(qr_comm, "should_quick_allreduce")
             and qr_comm.should_quick_allreduce(input_)
             and input_.shape == residual.shape
@@ -1263,6 +1290,30 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     return torch.empty_like(input_), torch.empty_like(residual)
 
 
+def _flydsl_fused_allreduce_rmsnorm_group_quant(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """``(quant_out, scale_out, residual_out, norm_out)`` from AITER's FlyDSL
+    INT4 all-reduce + RMSNorm followed by the per-1x128 FP8 quant the unfused
+    graph runs, or None when the FlyDSL schedules decline this call.
+    """
+    # The standalone quant is AITER's per-1x128 kernel.
+    if group_size != 128:
+        return None
+    qr_comm = _flydsl_fused_qr_comm(input_, residual, weight)
+    if qr_comm is None:
+        return None
+    norm_out, residual_out = qr_comm.fused_allreduce_rmsnorm(
+        input_, residual, weight, epsilon
+    )
+    quant_out, scale_out = _rocm_aiter_group_fp8_quant_impl(norm_out, group_size)
+    return quant_out, scale_out, residual_out, norm_out
+
+
 def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     input_: torch.Tensor,
     residual: torch.Tensor,
@@ -1273,6 +1324,12 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     """Fused AllReduce + RMSNorm + per-group FP8 quant."""
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
+    fly_result = _flydsl_fused_allreduce_rmsnorm_group_quant(
+        input_, residual, weight, epsilon, group_size
+    )
+    if fly_result is not None:
+        quant_out, scale_out, residual_out, _ = fly_result
+        return quant_out, residual_out, scale_out
     ca = aiter_ar.aiter_ca
 
     use_1stage = aiter_ar.use_1stage_fused_ar_rms(input_)
@@ -1326,6 +1383,12 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_impl(
     """
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
+    fly_result = _flydsl_fused_allreduce_rmsnorm_group_quant(
+        input_, residual, weight, epsilon, group_size
+    )
+    if fly_result is not None:
+        quant_out, scale_out, residual_out, norm_out = fly_result
+        return quant_out, residual_out, scale_out, norm_out
     ca = aiter_ar.aiter_ca
 
     use_1stage = aiter_ar.use_1stage_fused_ar_rms(input_)
